@@ -1,345 +1,196 @@
-# 🐕 Go2 黑线巡线系统
+# Go2 黑色线迹巡线器 (Line Tracker)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![ROS2](https://img.shields.io/badge/ROS2-Humble%20%7C%20Foxy-blue)](https://docs.ros.org/)
-[![Python](https://img.shields.io/badge/Python-3.8%2B-green)](https://www.python.org/)
+基于 [Unitree SDK2](https://github.com/unitreerobotics/unitree_sdk2)、OpenCV 和 RealSense D435i 的 Unitree Go2 机器狗地面黑色线迹巡线程序。
 
-基于 Unitree Go2 机器狗和 Intel RealSense D435i 深度相机的**黑线巡线系统**。提供 **SDK2 直连** 和 **ROS2 原生** 两种控制方案，支持 PI 自适应控制、浏览器实时调试。
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Robot-Unitree%20Go2-orange" alt="Go2">
-  <img src="https://img.shields.io/badge/Camera-RealSense%20D435i-00b0f0" alt="D435i">
-  <img src="https://img.shields.io/badge/Vision-OpenCV-5C3EE8" alt="OpenCV">
-</p>
+- 🖤 **线迹跟踪** — 全帧行扫描 + 最小二乘直线拟合，提取线的位置偏移和方向角度
+- 🎯 **智能弯道** — 角度 >50° 判定为弯道，切换方向搜索模式
+- 🔄 **丢失搜索** — 顺着上次方向旋转搜索 + 慢速前进
+- 📷 **D435i TCP 中继** — D435i 接在 Jetson Orin Nano 上，TCP 转发图像到笔记本
 
 ---
 
-## 📑 目录
+## 控制逻辑
 
-- [版本对比](#-版本对比)
-- [功能特性](#-功能特性)
-- [硬件要求](#-硬件要求)
-- [快速开始 (SDK2 版)](#-快速开始-sdk2-版)
-- [快速开始 (ROS2 版)](#-快速开始-ros2-版)
-- [参数说明](#-参数说明)
-- [网络配置](#-网络配置)
-- [调试页面](#-调试页面)
-- [项目结构](#-项目结构)
-- [常见问题](#-常见问题)
+```
+直线/缓弯 (angle ≤ 50°):
+  vyaw = -(kp_pos × offset − kp_angle × angle)   双 P 控制
+  vx   = base_vx - 弯道减速                         弯道自动降速
 
----
+直角弯 (angle > 50°):
+  vyaw = ±search_vyaw   顺着 last_line_angle 方向固定旋转
+  vx   = base_vx × 0.6  慢速前进
 
-## 🔀 版本对比
-
-本项目提供**两种实现方案**，按需选用：
-
-| 维度 | SDK2 直连版 | ROS2 原生版 |
-|------|------------|------------|
-| **入口** | `trackline.py` | `trackline_ros2/` |
-| **通信** | Unitree SDK2 Python 绑定 (DDS) | ROS2 topic `unitree_api::Request` (CycloneDDS) |
-| **依赖** | `unitree_sdk2_python` | ROS2 Humble/Foxy + `unitree_go` / `unitree_api` |
-| **启动** | `python3 trackline.py` | `ros2 launch unitree_trackline trackline.launch.py` |
-| **参数调优** | 命令行参数 (启动时固定) | `ros2 param set` 动态调整 |
-| **ROS2 工具链** | 不兼容 | ✅ rviz2 / rosbag / ros2 topic |
-| **多节点协作** | 单进程 | ✅ ROS2 节点图 |
-| **上手难度** | ⭐ 简单 | ⭐⭐ 需 ROS2 基础 |
-| **适用场景** | 快速验证、单机调试 | 生产部署、多传感器融合 |
-
-> 💡 **建议**：新手或快速测试用 SDK2 版；需要与 SLAM、导航栈等 ROS2 模块集成时用 ROS2 版。
+丢失 (0 个扫描点):
+  vyaw = ±search_vyaw   朝 last_line_offset 方向旋转搜索
+  vx   = 0               停止
+```
 
 ---
 
-## ✨ 功能特性
+## 系统架构
 
-- 🎯 **实时黑线检测** — OpenCV 多扫描线 + 三次多项式曲线拟合
-- 🎛️ **PI 自适应控制** — P(比例) + I(积分) 控制器，速度平滑滤波
-- 🛑 **智能丢线处理** — 短暂丢线直走 → 较长丢线减速 → 彻底丢线停止
-- 🌐 **Web 调试面板** — 浏览器实时画面 + 运动命令按钮 (stand/damp/stop)
-- 🔄 **自动重连** — SDK2 连接断开自动恢复
-- ⚡ **动态调参** — ROS2 版支持运行时 `ros2 param set` 无重启调参
-- 📸 **截图保存** — 按 `S` 键随时保存检测画面
+```
+Jetson Orin Nano (192.168.123.18)      开发笔记本
+┌────────────────────────┐             ┌─────────────────────────┐
+│ D435i → d435i_relay    │  TCP :9191  │ black_line_tracker      │
+│ (librealsense2)        │────────────→│  recv() → cv::Mat       │
+│                         │  BGR 图像   │  → DetectLine()         │
+│ Go2 运动控制 ←─────────┼──SDK2 DDS─│  → SportClient → Move() │
+└────────────────────────┘             └─────────────────────────┘
+```
+
+主循环每帧：**采集 → 全帧灰度二值化 → 行扫描 → 直线拟合 → 弯道检测 → 控制 → 显示**。
 
 ---
 
-## 🔧 硬件要求
+## 依赖
 
-| 设备 | 说明 |
+| 依赖 | 用途 | 安装说明 |
+|------|------|----------|
+| Unitree SDK2 | DDS 通信 + 运动控制 | [GitHub](https://github.com/unitreerobotics/unitree_sdk2) |
+| OpenCV (≥4.x) | 图像处理 + GUI | `sudo apt install libopencv-dev` |
+| CMake (≥3.10) | 构建系统 | `sudo apt install cmake` |
+| C++17 编译器 | 编译 | `sudo apt install build-essential` |
+
+Jetson 额外依赖：`sudo apt install ros-humble-librealsense2`
+
+---
+
+## 编译
+
+### 默认模式（Go2 内置摄像头）
+
+```bash
+mkdir build && cd build
+cmake .. -DUNITREE_SDK2_ROOT=/path/to/unitree_sdk2
+make -j$(nproc)
+```
+
+### D435i 模式（TCP 中继）
+
+```bash
+mkdir build && cd build
+cmake .. -DUSE_REALSENSE=ON -DUNITREE_SDK2_ROOT=/path/to/unitree_sdk2
+make -j$(nproc)
+```
+
+编译产物：
+
+| 目标 | 说明 |
 |------|------|
-| **Unitree Go2** | 机器狗，固件支持 DDS 通信 |
-| **Intel RealSense D435i** | 深度相机，USB 3.0 连接 |
-| **网线** | 连接电脑与 Go2 的有线网络 |
-| **Ubuntu 20.04/22.04** | 运行环境 |
+| `build/black_line_tracker` | 巡线主程序（笔记本运行） |
+| `build/d435i_relay` | TCP 中继（x86_64，传到 Jetson 需在 ARM64 上重新编译） |
 
 ---
 
-## 🚀 快速开始 (SDK2 版)
+## 部署与运行
 
-### 1. 安装依赖
+### 1. Jetson 上编译并运行中继
 
 ```bash
-cd trackline
-bash setup_env.sh
+# 将 d435i_relay.cpp 传到 Jetson
+scp build/d435i_relay.cpp unitree@192.168.123.18:~/
+
+# Jetson 上本地编译（ARM64）
+ssh unitree@192.168.123.18
+g++ -std=c++17 d435i_relay.cpp -lrealsense2 -lpthread -o d435i_relay
+
+# 运行（D435i 已 USB 连接）
+./d435i_relay
 ```
 
-脚本自动安装：`opencv-python`, `numpy`, `pyrealsense2`, `unitree_sdk2_python`
-
-### 2. 连接 Go2
-
-网线连接电脑与 Go2，设置电脑 IP 为 `192.168.123.99/24`。
-
-### 3. 启动巡线
+### 2. 笔记本上运行
 
 ```bash
-# 完整巡线 (默认参数)
-python3 trackline.py
+# 基本用法
+./run_black_line_tracker.sh enp8s0
 
-# 仅调试画面，不控制机器人
-python3 trackline.py --no-motion
-
-# 自定义参数
-python3 trackline.py --speed 0.3 --kp 0.008 --threshold 70
-
-# 指定网口
-python3 trackline.py --interface eth0
-```
-
-### 4. 查看调试画面
-
-浏览器打开 `http://127.0.0.1:8081`
-
----
-
-## 🚀 快速开始 (ROS2 版)
-
-### 1. 安装 Unitree ROS2 工作空间
-
-```bash
-# 克隆 unitree_ros2 (如果还没有)
-cd ~
-git clone https://github.com/unitreerobotics/unitree_ros2
-
-# 安装 ROS2 依赖
-sudo apt install ros-$ROS_DISTRO-rmw-cyclonedds-cpp
-sudo apt install ros-$ROS_DISTRO-rosidl-generator-dds-idl
-sudo apt install libyaml-cpp-dev
-
-# 编译 cyclonedds_ws
-cd ~/unitree_ros2/cyclonedds_ws
-source /opt/ros/$ROS_DISTRO/setup.bash
-colcon build
-```
-
-### 2. 集成 trackline_ros2 包
-
-```bash
-# 将 trackline_ros2 链接到 example workspace
-ln -s /path/to/trackline/trackline_ros2 ~/unitree_ros2/example/src/trackline_ros2
-
-# 编译
-cd ~/unitree_ros2/example
-source ~/unitree_ros2/cyclonedds_ws/install/setup.bash
-colcon build
-```
-
-### 3. 配置环境
-
-```bash
-source ~/unitree_ros2/setup.sh        # 自动检测网口
-# source ~/unitree_ros2/setup.sh eth0  # 指定网口
-```
-
-### 4. 启动巡线
-
-```bash
-# launch 方式 (推荐)
-ros2 launch unitree_trackline trackline.launch.py
-
-# 节点方式
-ros2 run unitree_trackline trackline_node
-
-# 带自定义参数
-ros2 launch unitree_trackline trackline.launch.py speed:=0.3 kp:=0.008
-
-# 仅调试模式
-ros2 launch unitree_trackline trackline.launch.py enable_motion:=false
-```
-
-### 5. 运行时动态调整参数
-
-```bash
-ros2 param set /trackline_node speed 0.4
-ros2 param set /trackline_node kp 0.008
-ros2 param set /trackline_node gray_threshold 70
-ros2 param list  # 查看所有可调参数
+# 仅检测、调参
+./run_black_line_tracker.sh enp8s0 --no-move
 ```
 
 ---
 
-## 📊 参数说明
+## 界面说明
 
-### 运动控制
+弹出 2 个 OpenCV 窗口：
 
-| 参数 | 默认值 | CLI (SDK2) | ROS2 Param | 说明 |
-|------|--------|-----------|------------|------|
-| 线速度 | 0.3 m/s | `--speed` | `speed` | 前进速度，建议 0.2–0.5 |
-| P 系数 | 0.005 | `--kp` | `kp` | 比例控制，越大转向越激进 |
-| I 系数 | 0.0001 | `--ki` | `ki` | 积分控制，消除稳态误差 |
-| 最大角速度 | 0.5 rad/s | `--max-angular` | `max_angular` | 转向限幅保护 |
-| 减速比例 | 0.5 | `--low-speed` | `low_speed_ratio` | 丢线减速时的速度比例 |
+| 窗口名 | 内容 |
+|--------|------|
+| **Line Tracker** | 主画面，叠加拟合线、扫描点、控制状态 |
+| **Threshold (调参)** | 二值化掩码 + Trackbar 滑块 |
 
-### 丢线处理
+### 主画面标注
 
-| 参数 | 默认值 | CLI (SDK2) | ROS2 Param | 说明 |
-|------|--------|-----------|------------|------|
-| 丢线阈值 | 30 帧 | `--lost-threshold` | `lost_threshold` | 连续丢线多少帧后减速 |
-| 检测阈值 | 2 点 | — | `detect_threshold` | 最少有效检测点数 |
-
-### 视觉检测
-
-| 参数 | 默认值 | CLI (SDK2) | ROS2 Param | 说明 |
-|------|--------|-----------|------------|------|
-| 灰度阈值 | 80 | `--threshold` | `gray_threshold` | 黑线灰度 (0–255)，越低越敏感 |
-| 扫描线数 | 20 | — | `scan_lines` | 影响检测密度 |
-| 最小线宽 | 8 px | — | `min_width` | 过滤噪点 |
-
-### 调试
-
-| 参数 | 默认值 | CLI (SDK2) | ROS2 Param | 说明 |
-|------|--------|-----------|------------|------|
-| HTTP 端口 | 8081 | `--port` | `http_port` | Web 调试页面端口 |
-| 启用运动 | true | `--no-motion` | `enable_motion` | 是否控制机器人 |
-| 启用 HTTP | true | `--no-http` | `enable_http` | 是否启动调试服务器 |
+| 标记 | 含义 |
+|------|------|
+| 蓝色竖线 | 画面垂直中线（偏移量零点） |
+| 绿色小圆点 | 各行扫描到的黑色段中点 |
+| 绿色实线 | 最小二乘拟合线迹 |
+| 左上角 | `LINE off:... ang:...° vx:... vyaw:...` |
+| 橙色文字 | `LINE LOST ... SEARCHING` |
 
 ---
 
-## 🌐 网络配置
+## 检测原理
 
-Go2 默认通信 IP 为 `192.168.123.161`，电脑需配置同网段静态 IP：
-
-```bash
-# 方式一：命令行 (临时)
-sudo ip addr add 192.168.123.99/24 dev eth0
-
-# 方式二：图形界面
-# Settings → Network → Wired → IPv4 → Manual
-# Address: 192.168.123.99  Netmask: 255.255.255.0
-
-# 验证连通
-ping 192.168.123.161
-```
+1. 全帧灰度化 → 固定阈值二值化（THRESH_BINARY_INV）→ 形态学去噪
+2. 等间距扫描 6 行（从下到上），每行找最长黑色段的中点
+3. 最小二乘直线拟合 $x = a \cdot y + b$
+4. 提取 $offset = x_{bottom} - center\_x$ 和 $angle = \arctan(a)$
+5. 角度 >50° 进入弯道模式，用进弯前保存的方向旋转搜索
 
 ---
 
-## 🖥️ 调试页面
+## 调参
 
-程序启动后，浏览器访问 `http://127.0.0.1:8081`：
+| Trackbar | 范围 | 默认 | 说明 |
+|----------|------|------|------|
+| **Threshold** | 0~255 | 80 | 二值化阈值 |
+| **Morph Size** | 1~21 | 5 | 形态学核大小 |
+| **ROI %** | 5~100 | 100 | 全帧检测 |
+| **Scan Rows** | 2~20 | 6 | 扫描行数 |
 
-- 📷 **实时检测画面** — 黑线拟合曲线 + 偏移量指示
-- 📊 **状态信息** — 当前模式、速度指令、检测点数、连接状态
-- 🎮 **运动控制按钮** — 起立/趴下/平衡站立/阻尼/停止 (ROS2 版)
+控制参数（`TrackParams` 结构体）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `kp_pos` | 0.01 | 位置 P 系数 |
+| `kp_angle` | 0.8 | 角度 P 系数 |
+| `max_vyaw` | 2.5 | 最大转向角速度 (rad/s) |
+| `base_vx` | 0.35 | 基准前进速度 (m/s) |
+| `curve_vx_min` | 0.12 | 弯道最低速度 (m/s) |
+| `search_vyaw` | 0.8 | 搜索旋转速度 (rad/s) |
+| `kCornerAngle` | 0.87 (50°) | 弯道判定阈值 |
 
 ---
 
-## 📁 项目结构
+## 故障排查
+
+| 问题 | 可能原因 | 解决方法 |
+|------|----------|----------|
+| `GetImageSample 失败` | 内置摄像头模式，网络不通 | 检查网线 / 接口名 |
+| 连不上 TCP 中继 | Jetson 上未运行 relay | SSH 检查 `./d435i_relay` |
+| `Exec format error` | ARM64 / x86_64 不匹配 | 在 Jetson 上本地编译 |
+| 检测不到线 | 阈值不匹配 | `--no-move` 调 Threshold |
+| 弯道过不去 | `kCornerAngle` 或速度不合适 | 调整参数 |
+
+---
+
+## 文件结构
 
 ```
-trackline/
-├── README.md                       # 项目总览 (本文件)
-├── setup_env.sh                    # SDK2 版一键安装脚本
-├── trackline.py                    # SDK2 直连版主程序
-│
-└── trackline_ros2/                 # ROS2 原生版 (ROS2 Package)
-    ├── README.md                   # ROS2 版详细文档
-    ├── package.xml                 # ROS2 包元数据
-    ├── setup.py                    # Python 安装
-    ├── setup.cfg
-    ├── resource/
-    │   └── unitree_trackline       # ament 索引
-    ├── launch/
-    │   └── trackline.launch.py     # ROS2 Launch 文件
-    ├── config/
-    │   └── trackline_params.yaml   # 默认参数 YAML
-    └── unitree_trackline/
-        ├── __init__.py
-        ├── trackline_node.py       # ROS2 巡线主节点
-        ├── vision.py               # 黑线视觉检测 (BlackLineDetector)
-        ├── sport_client.py         # Go2 ROS2 运动客户端 (SportClient)
-        └── debug_server.py         # HTTP 调试服务器 (DebugHTTPServer)
-```
-
-### 模块依赖关系
-
-```mermaid
-graph TD
-    CAM[RealSense D435i] -->|BGR Frame| VIS[vision.py<br/>BlackLineDetector]
-    VIS -->|offset, points| NODE[trackline_node.py<br/>PI Controller + State Machine]
-    NODE -->|vx, vyaw| SPT[sport_client.py<br/>ROS2 SportClient]
-    SPT -->|ROS2 Topic: /api/sport/request| GO2[Go2 Robot]
-    NODE -->|JPEG Frame| HTTP[debug_server.py<br/>HTTP Debug Server]
-    GO2 -->|ROS2 Topic: /lf/sportmodestate| SPT
-    HTTP -->|Browser| UI[Web UI :8081]
+black_line_tracker/
+├── CMakeLists.txt              # 构建配置
+├── README.md
+├── run_black_line_tracker.sh   # 启动脚本
+└── src/
+    ├── black_line_tracker.cpp  # 巡线主程序
+    └── d435i_relay.cpp         # D435i TCP 中继
 ```
 
 ---
 
-## ❓ 常见问题
-
-<details>
-<summary><b>RealSense D435i 未检测到</b></summary>
-
-```bash
-lsusb | grep Intel
-rs-enumerate-devices
-sudo apt install --reinstall librealsense2-dkms librealsense2-utils
-```
-</details>
-
-<details>
-<summary><b>SDK2 / ROS2 连接不上 Go2</b></summary>
-
-```bash
-# 检查物理连接 (网线/网口指示灯)
-ip addr show eth0          # 应为 192.168.123.99
-ping 192.168.123.161       # Go2 默认 IP
-sudo ufw status            # 检查防火墙
-ros2 topic list | grep sport  # ROS2 版验证话题
-```
-</details>
-
-<details>
-<summary><b>黑线检测不稳定</b></summary>
-
-- 调整灰度阈值：光线暗时降低，光线亮时提高
-- 确保黑线与地面有足够对比度
-- 调整相机角度使黑线在画面下方 3/4 区域内
-- 增加 `scan_lines` 提高检测密度
-</details>
-
-<details>
-<summary><b>机器人转向过度/不足</b></summary>
-
-- 增大 `kp` → 转向更激进 | 减小 `kp` → 转向更柔和
-- 增大 `ki` → 更好地纠正稳态偏移
-- 限制 `max_angular` 防止急转
-</details>
-
-<details>
-<summary><b>相机权限问题</b></summary>
-
-```bash
-sudo usermod -aG video $USER
-# 重新登录后生效
-```
-</details>
-
----
-
-## 🙏 致谢
-
-- [Unitree Robotics](https://github.com/unitreerobotics) — Go2 SDK2 & ROS2 支持
-- [Intel RealSense](https://github.com/IntelRealSense/librealsense) — D435i 相机驱动
-- [OpenCV](https://opencv.org/) — 计算机视觉库
-
-## 📄 License
+## 许可
 
 MIT License
